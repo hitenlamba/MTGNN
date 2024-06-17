@@ -6,6 +6,10 @@ from util import *
 from trainer import Trainer
 from net import gtnet
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+
 def str_to_bool(value):
     if isinstance(value, bool):
         return value
@@ -18,7 +22,7 @@ def str_to_bool(value):
 
 parser = argparse.ArgumentParser()
 
-parser.add_argument('--device',type=str,default='cuda:1',help='')
+parser.add_argument('--device',type=str,default='cuda:0',help='')
 parser.add_argument('--data',type=str,default='data/METR-LA',help='data path')
 
 parser.add_argument('--adj_data', type=str,default='data/sensor_graph/adj_mx.pkl',help='adj data path')
@@ -72,97 +76,107 @@ args = parser.parse_args()
 torch.set_num_threads(3)
 
 
+
 def main(runid):
-    # torch.manual_seed(args.seed)
-    # torch.backends.cudnn.deterministic = True
-    # torch.backends.cudnn.benchmark = False
-    # np.random.seed(args.seed)
-    #load data
-    device = torch.device(args.device)
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Load data
     dataloader = load_dataset(args.data, args.batch_size, args.batch_size, args.batch_size)
     scaler = dataloader['scaler']
 
+    # Load predefined adjacency matrix and move it to the device
     predefined_A = load_adj(args.adj_data)
-    predefined_A = torch.tensor(predefined_A)-torch.eye(args.num_nodes)
+    predefined_A = torch.tensor(predefined_A) - torch.eye(args.num_nodes)
     predefined_A = predefined_A.to(device)
 
-    # if args.load_static_feature:
-    #     static_feat = load_node_feature('data/sensor_graph/location.csv')
-    # else:
-    #     static_feat = None
-
-    model = gtnet(args.gcn_true, args.buildA_true, args.gcn_depth, args.num_nodes,
-                  device, predefined_A=predefined_A,
-                  dropout=args.dropout, subgraph_size=args.subgraph_size,
-                  node_dim=args.node_dim,
-                  dilation_exponential=args.dilation_exponential,
-                  conv_channels=args.conv_channels, residual_channels=args.residual_channels,
-                  skip_channels=args.skip_channels, end_channels= args.end_channels,
-                  seq_length=args.seq_in_len, in_dim=args.in_dim, out_dim=args.seq_out_len,
-                  layers=args.layers, propalpha=args.propalpha, tanhalpha=args.tanhalpha, layer_norm_affline=True)
+    # Initialize model and move it to the device
+    model = gtnet(
+        args.gcn_true, args.buildA_true, args.gcn_depth, args.num_nodes,
+        device, predefined_A=predefined_A,
+        dropout=args.dropout, subgraph_size=args.subgraph_size,
+        node_dim=args.node_dim, dilation_exponential=args.dilation_exponential,
+        conv_channels=args.conv_channels, residual_channels=args.residual_channels,
+        skip_channels=args.skip_channels, end_channels=args.end_channels,
+        seq_length=args.seq_in_len, in_dim=args.in_dim, out_dim=args.seq_out_len,
+        layers=args.layers, propalpha=args.propalpha, tanhalpha=args.tanhalpha, layer_norm_affline=True
+    ).to(device)
 
     print(args)
-    print('The recpetive field size is', model.receptive_field)
+    print('The receptive field size is', model.receptive_field)
     nParams = sum([p.nelement() for p in model.parameters()])
     print('Number of model parameters is', nParams)
 
-    engine = Trainer(model, args.learning_rate, args.weight_decay, args.clip, args.step_size1, args.seq_out_len, scaler, device, args.cl)
+    engine = Trainer(
+        model, args.learning_rate, args.weight_decay, args.clip, 
+        args.step_size1, args.seq_out_len, scaler, device, args.cl
+    )
 
-    print("start training...",flush=True)
-    his_loss =[]
+    print("start training...", flush=True)
+    his_loss = []
     val_time = []
     train_time = []
     minl = 1e5
-    for i in range(1,args.epochs+1):
+
+    for i in range(1, args.epochs + 1):
         train_loss = []
         train_mape = []
         train_rmse = []
         t1 = time.time()
         dataloader['train_loader'].shuffle()
+
         for iter, (x, y) in enumerate(dataloader['train_loader'].get_iterator()):
             trainx = torch.Tensor(x).to(device)
-            trainx= trainx.transpose(1, 3)
+            trainx = trainx.transpose(1, 3)
             trainy = torch.Tensor(y).to(device)
             trainy = trainy.transpose(1, 3)
-            if iter%args.step_size2==0:
+
+            if iter % args.step_size2 == 0:
                 perm = np.random.permutation(range(args.num_nodes))
-            num_sub = int(args.num_nodes/args.num_split)
+            num_sub = int(args.num_nodes / args.num_split)
+
             for j in range(args.num_split):
-                if j != args.num_split-1:
+                if j != args.num_split - 1:
                     id = perm[j * num_sub:(j + 1) * num_sub]
                 else:
                     id = perm[j * num_sub:]
                 id = torch.tensor(id).to(device)
                 tx = trainx[:, :, id, :]
                 ty = trainy[:, :, id, :]
-                metrics = engine.train(tx, ty[:,0,:,:],id)
+                metrics = engine.train(tx, ty[:, 0, :, :], id)
                 train_loss.append(metrics[0])
                 train_mape.append(metrics[1])
                 train_rmse.append(metrics[2])
-            if iter % args.print_every == 0 :
+
+            if iter % args.print_every == 0:
                 log = 'Iter: {:03d}, Train Loss: {:.4f}, Train MAPE: {:.4f}, Train RMSE: {:.4f}'
-                print(log.format(iter, train_loss[-1], train_mape[-1], train_rmse[-1]),flush=True)
+                print(log.format(iter, train_loss[-1], train_mape[-1], train_rmse[-1]), flush=True)
+
         t2 = time.time()
-        train_time.append(t2-t1)
-        #validation
+        train_time.append(t2 - t1)
+
+        # Validation
         valid_loss = []
         valid_mape = []
         valid_rmse = []
-
         s1 = time.time()
+
         for iter, (x, y) in enumerate(dataloader['val_loader'].get_iterator()):
             testx = torch.Tensor(x).to(device)
             testx = testx.transpose(1, 3)
             testy = torch.Tensor(y).to(device)
             testy = testy.transpose(1, 3)
-            metrics = engine.eval(testx, testy[:,0,:,:])
+            metrics = engine.eval(testx, testy[:, 0, :, :])
             valid_loss.append(metrics[0])
             valid_mape.append(metrics[1])
             valid_rmse.append(metrics[2])
+
         s2 = time.time()
         log = 'Epoch: {:03d}, Inference Time: {:.4f} secs'
-        print(log.format(i,(s2-s1)))
-        val_time.append(s2-s1)
+        print(log.format(i, (s2 - s1)))
+        val_time.append(s2 - s1)
+
         mtrain_loss = np.mean(train_loss)
         mtrain_mape = np.mean(train_mape)
         mtrain_rmse = np.mean(train_rmse)
@@ -173,15 +187,14 @@ def main(runid):
         his_loss.append(mvalid_loss)
 
         log = 'Epoch: {:03d}, Train Loss: {:.4f}, Train MAPE: {:.4f}, Train RMSE: {:.4f}, Valid Loss: {:.4f}, Valid MAPE: {:.4f}, Valid RMSE: {:.4f}, Training Time: {:.4f}/epoch'
-        print(log.format(i, mtrain_loss, mtrain_mape, mtrain_rmse, mvalid_loss, mvalid_mape, mvalid_rmse, (t2 - t1)),flush=True)
+        print(log.format(i, mtrain_loss, mtrain_mape, mtrain_rmse, mvalid_loss, mvalid_mape, mvalid_rmse, (t2 - t1)), flush=True)
 
-        if mvalid_loss<minl:
-            torch.save(engine.model.state_dict(), args.save + "exp" + str(args.expid) + "_" + str(runid) +".pth")
+        if mvalid_loss < minl:
+            torch.save(engine.model.state_dict(), args.save + "exp" + str(args.expid) + "_" + str(runid) + ".pth")
             minl = mvalid_loss
 
     print("Average Training Time: {:.4f} secs/epoch".format(np.mean(train_time)))
     print("Average Inference Time: {:.4f} secs".format(np.mean(val_time)))
-
 
     bestid = np.argmin(his_loss)
     engine.model.load_state_dict(torch.load(args.save + "exp" + str(args.expid) + "_" + str(runid) +".pth"))
@@ -281,7 +294,6 @@ if __name__ == "__main__":
     for i in [2,5,11]:
         log = '{:d}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}'
         print(log.format(i+1, amae[i], armse[i], amape[i], smae[i], srmse[i], smape[i]))
-
 
 
 
